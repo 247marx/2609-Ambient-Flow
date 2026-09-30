@@ -1,0 +1,719 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ambient Flow</title>
+<style>
+  html, body {
+    margin: 0; padding: 0; width: 100%; height: 100%;
+    background: #000; overflow: hidden; cursor: none;
+  }
+  canvas { display: block; width: 100vw; height: 100vh; }
+  #dbg {
+    position: fixed; top: 10px; right: 10px; padding: 8px 10px;
+    background: rgba(0,0,0,0.6); color: #8f8; font: 12px/1.4 Consolas, monospace;
+    white-space: pre; display: none; pointer-events: none;
+  }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="dbg"></div>
+
+<script>
+'use strict';
+/*
+ * AMBIENT FLOW
+ * Zehn ruhige, selbst entworfene Welten, kombiniert zu 25 Varianten.
+ * Alles wird in Echtzeit auf der Grafikkarte berechnet: keine Videos, keine Bilder.
+ * Jede Variante startet bei jedem Auftritt mit neuen Zufallswerten, dadurch
+ * wiederholt sich das Bild praktisch nie. Übergänge sind lange, weiche Überblendungen.
+ *
+ * URL-Parameter (optional):
+ *   ?dur=100       Sekunden pro Variante (inkl. Überblendung)
+ *   ?fade=20       Sekunden Überblendung
+ *   ?speed=1       Tempo aller Bewegungen (0.5 = noch ruhiger)
+ *   ?only=silk,sea nur bestimmte Welten: silk aurora ink topo dunes bokeh mesh stream sea clouds
+ *   ?skip=topo     Welten auslassen
+ *   ?v=7           nur eine bestimmte Variante (Nummer 0..24), zum Testen
+ *   ?maxres=1920   maximale interne Breite in Pixeln
+ *   ?brightness=1  Helligkeit
+ *   ?debug=1       FPS/Auflösung einblenden (Taste D)
+ *   ?reload=12     Seite alle x Stunden neu laden (Standard: aus)
+ * Tasten: Pfeil rechts / Klick = nächste Variante, D = Debug
+ */
+
+// ---------------------------------------------------------------- Konfiguration
+const Q = new URLSearchParams(location.search);
+const list = k => (Q.get(k) || '').split(',').map(s => s.trim()).filter(Boolean);
+const CFG = {
+  dur:     +Q.get('dur') || 100,
+  fade:    +Q.get('fade') || 20,
+  speed:   +Q.get('speed') || 1,
+  maxW:    +Q.get('maxres') || 1920,
+  debug:   Q.get('debug') === '1',
+  only:    list('only'),
+  skip:    list('skip'),
+  v:       Q.has('v') ? +Q.get('v') : -1,
+  bright:  +Q.get('brightness') || 1,
+  reloadH: +Q.get('reload') || 0,
+  t0:      +Q.get('t') || 0,        // Testhilfe: Szenenzeit vorspulen
+};
+const MIN_SCALE = 0.3, MAX_SCALE = 1.0;
+
+// ---------------------------------------------------------------- Shader
+const VS = `attribute vec2 aPos; void main(){ gl_Position = vec4(aPos, 0.0, 1.0); }`;
+
+const HEAD = `
+#ifdef GL_FRAGMENT_PRECISION_HIGH
+precision highp float;
+#else
+precision mediump float;
+#endif
+uniform vec2 uRes;
+uniform float uTime;
+uniform vec4 uSeed;
+uniform vec4 uP;
+uniform vec3 uC0; uniform vec3 uC1; uniform vec3 uC2; uniform vec3 uC3;
+#define TAU 6.28318530718
+mat2 rot(float a){ float c = cos(a), s = sin(a); return mat2(c, s, -s, c); }
+float h21(vec2 p){ vec3 q = fract(p.xyx*0.1031); q += dot(q, q.yzx + 33.33); return fract((q.x + q.y)*q.z); }
+vec2 h22(vec2 p){ vec3 q = fract(p.xyx*vec3(0.1031, 0.1030, 0.0973)); q += dot(q, q.yzx + 33.33); return fract((q.xx + q.yz)*q.zy)*2.0 - 1.0; }
+vec2 P(){ return (2.0*gl_FragCoord.xy - uRes)/uRes.y; }
+// Gradientenrauschen, Wertebereich etwa -0.7 .. 0.7
+float gn(vec2 p){
+  vec2 i = floor(p), f = fract(p);
+  vec2 u = f*f*f*(f*(f*6.0 - 15.0) + 10.0);
+  return mix(mix(dot(h22(i), f), dot(h22(i + vec2(1.0, 0.0)), f - vec2(1.0, 0.0)), u.x),
+             mix(dot(h22(i + vec2(0.0, 1.0)), f - vec2(0.0, 1.0)), dot(h22(i + vec2(1.0, 1.0)), f - vec2(1.0, 1.0)), u.x), u.y);
+}
+float fbm3(vec2 p){
+  float f = 0.0, a = 0.5;
+  mat2 m = mat2(1.6, 1.2, -1.2, 1.6);
+  for(int i = 0; i < 3; i++){ f += a*gn(p); p = m*p; a *= 0.5; }
+  return f;
+}
+// weicher Farbverlauf C1 -> C2 -> C3 -> C1
+vec3 ramp(float t){
+  t = fract(t)*3.0;
+  vec3 c = mix(uC1, uC2, smoothstep(0.0, 1.0, clamp(t, 0.0, 1.0)));
+  c = mix(c, uC3, smoothstep(0.0, 1.0, clamp(t - 1.0, 0.0, 1.0)));
+  return mix(c, uC1, smoothstep(0.0, 1.0, clamp(t - 2.0, 0.0, 1.0)));
+}
+`;
+
+// Seide: halbtransparente Bänder, die sich langsam drehen und falten
+// uP: x = Fächerbreite, y = Neigung, z = Bandbreite
+const FS_SILK = `
+float ry(float x, float fi, float t, float ph){
+  return 0.30*sin(x*(0.75 + 0.1*fi) + t*(0.8 + 0.13*fi) + ph + fi*1.1)
+       + 0.12*sin(x*(1.7 + 0.15*fi) - t*(0.55 + 0.07*fi) + fi*2.3 + ph*1.7)
+       + (fi/5.0 - 0.5)*uP.x;
+}
+void main(){
+  vec2 p = P();
+  vec2 uv = gl_FragCoord.xy/uRes;
+  float t = uTime*0.045;
+  float ph = TAU*uSeed.x;
+  p = rot(uP.y)*p;
+  vec3 col = mix(uC0*0.7, uC0*1.6 + uC1*0.04, uv.y);
+  for(int i = 0; i < 6; i++){
+    float fi = float(i);
+    float y = ry(p.x, fi, t, ph);
+    float sl = (ry(p.x + 0.01, fi, t, ph) - y)/0.01;
+    float a = p.x*(0.55 + 0.08*fi) + t*(0.5 + 0.09*fi) + fi*1.9 + ph;
+    float w = (0.02 + 0.13*abs(cos(a)))*uP.z;
+    float d = (p.y - y)/sqrt(1.0 + sl*sl);
+    float v = d/w;
+    float body = smoothstep(1.0, 0.75, abs(v));
+    float face = 0.5 + 0.5*sin(a + v*0.7);
+    float lit = 0.25 + 0.75*face*face;
+    float spec = pow(max(0.0, sin(a + v*0.9 + 0.4)), 14.0);
+    vec3 rc = ramp(fi*0.12 + 0.08*sin(p.x*0.6 + t) + uSeed.y);
+    vec3 c = rc*lit + vec3(1.0, 0.97, 0.92)*spec*0.4;
+    col = mix(col, c, body*0.7);
+    col += rc*0.05*exp(-abs(d)/(w + 0.08));
+  }
+  gl_FragColor = vec4(col, 1.0);
+}`;
+
+// Nordlicht: Lichtvorhänge über einer Hügelsilhouette
+// uP: x = Intensität
+const FS_AURORA = `
+void main(){
+  vec2 p = P();
+  float t = uTime*0.03;
+  vec3 col = mix(uC0*1.8 + uC3*0.03, uC0*0.5, smoothstep(-0.8, 1.0, p.y));
+  vec2 g = gl_FragCoord.xy/uRes.y*110.0;
+  vec2 id = floor(g);
+  float hs = h21(id + 7.0*uSeed.x);
+  if(hs > 0.982){
+    vec2 f = fract(g) - 0.5 - (vec2(h21(id + 1.3), h21(id + 2.7)) - 0.5)*0.6;
+    float tw = 0.6 + 0.4*sin(uTime*0.3 + hs*80.0);
+    col += vec3(0.85, 0.9, 1.0)*exp(-dot(f, f)*70.0)*0.5*tw*smoothstep(-0.5, 0.6, p.y);
+  }
+  for(int k = 0; k < 3; k++){
+    float fk = float(k);
+    float x = p.x*(0.55 + 0.2*fk) + uSeed.y*20.0 + fk*3.1;
+    float yb = -0.15 + 0.22*fk + 0.35*gn(vec2(x*0.6 + t*0.5, fk*5.0 + t*0.15));
+    float fold = gn(vec2(x*2.2 - t*0.7, fk*2.0 + t*0.25));
+    yb += 0.07*fold;
+    float dy = p.y - yb;
+    float I = smoothstep(-0.03, 0.05, dy)*exp(-max(dy, 0.0)*(2.4 - 0.4*fk));
+    float rays = clamp(0.65 + 0.9*gn(vec2(x*7.0 + fold*3.0, t*0.4 + fk)), 0.2, 1.3);
+    float along = smoothstep(-0.25, 0.35, gn(vec2(x*0.45 - t*0.3, 9.0 + fk)));
+    vec3 c = mix(uC2, uC3, smoothstep(0.0, 0.55, dy));
+    col += c*I*rays*along*(0.6 - 0.14*fk)*uP.x;
+  }
+  float hill = -0.72 + 0.09*gn(vec2(p.x*1.2 + uSeed.z*30.0, 0.5)) + 0.03*gn(vec2(p.x*4.0, 1.5));
+  col = mix(col, uC0*0.35, smoothstep(hill + 0.006, hill - 0.006, p.y));
+  gl_FragColor = vec4(col, 1.0);
+}`;
+
+// Tinte: Farbe, die sich langsam in Wasser verteilt
+// uP: x = Verwirbelung, y = Maßstab
+const FS_INK = `
+void main(){
+  vec2 p = P()*uP.y + uSeed.xy*10.0;
+  float t = uTime*0.016;
+  float k = uP.x;
+  vec2 q = vec2(fbm3(p + vec2(0.0, t)), fbm3(p + vec2(5.2, 1.3) - t));
+  vec2 r = vec2(fbm3(p + k*q + vec2(1.7, 9.2) + 0.7*t), fbm3(p + k*q + vec2(8.3, 2.8) - 0.5*t));
+  float f = 0.5 + 0.9*fbm3(p + k*r);
+  float f2 = 0.5 + 0.9*fbm3(p + k*r + vec2(0.03, 0.03));
+  vec3 col = mix(uC0, uC1*0.9, smoothstep(0.25, 0.75, f));
+  col = mix(col, uC2, smoothstep(0.2, 0.75, length(q)*1.6)*smoothstep(0.35, 0.8, f)*0.85);
+  col = mix(col, uC3, smoothstep(0.1, 0.6, r.x + 0.2)*0.35);
+  col *= 0.9 + 0.5*clamp((f - f2)*6.0, -0.3, 0.6);
+  col *= 0.75 + 0.35*f;
+  gl_FragColor = vec4(col, 1.0);
+}`;
+
+// Topografie: Höhenlinien einer sich langsam verformenden Landschaft
+// uP: x = Anzahl Linien
+const FS_TOPO = `
+float field(vec2 p, float t){ return fbm3(p*0.6 + vec2(t*0.3, -t*0.2)) + 0.6*gn(p*0.3 - vec2(t*0.12, t*0.05)); }
+void main(){
+  vec2 p = P() + uSeed.xy*10.0;
+  float t = uTime*0.022;
+  float px = 2.0/uRes.y;
+  float f = field(p, t);
+  float fx = field(p + vec2(px, 0.0), t) - f;
+  float fy = field(p + vec2(0.0, px), t) - f;
+  float g = max(length(vec2(fx, fy))/px, 1e-4);
+  float N = uP.x;
+  float v = f*N;
+  float dist = (0.5 - abs(fract(v) - 0.5))/(g*N);
+  float idx = floor(v + 0.5);
+  float major = 1.0 - step(0.5, mod(idx, 5.0));
+  float line = smoothstep((1.6 + major)*px, 0.3*px, dist);
+  vec3 lc = ramp(idx*0.045 + uSeed.z + t*0.1);
+  vec3 col = uC0 + ramp(floor(v)*0.045 + uSeed.z + t*0.1)*0.06;
+  col += lc*line*(0.4 + 0.35*major);
+  col += lc*0.1*smoothstep(12.0*px, 0.0, dist);
+  vec2 uv = gl_FragCoord.xy/uRes;
+  col *= 0.8 + 0.3*uv.y;
+  gl_FragColor = vec4(col, 1.0);
+}`;
+
+// Dünenmeer: langsamer Flug über Sanddünen bei tiefstehender Sonne
+// uP: x = Sonnenposition
+const FS_DUNES = `
+float dune(vec2 q){
+  vec2 w = q + 0.7*vec2(gn(q*0.13), gn(q*0.13 + 7.3));
+  float r = abs(sin(w.x*0.8 + 0.5*sin(w.y*0.35)));
+  float h = 1.0 - r;
+  return h*h*0.9 + 0.35*gn(q*0.35);
+}
+void main(){
+  vec2 p = P();
+  float t = uTime*0.25;
+  float hor = 0.12;
+  vec2 sun = vec2(uP.x, hor + 0.14);
+  vec3 skyH = mix(uC2, uC1, 0.35);
+  vec3 col = mix(skyH, uC0*1.3, smoothstep(hor, 1.1, p.y));
+  float ds = length(p - sun);
+  col += uC2*exp(-ds*9.0)*0.9 + uC2*exp(-ds*2.2)*0.25;
+  if(p.y < hor){
+    float z = 0.32/(hor - p.y);
+    vec2 q = vec2(p.x*z, z)*5.0 + vec2(uSeed.x*50.0, t);
+    float e = 0.04;
+    float h = dune(q);
+    vec3 n = normalize(vec3(-(dune(q + vec2(e, 0.0)) - h)/e*1.1, 1.0, -(dune(q + vec2(0.0, e)) - h)/e*1.1));
+    vec3 L = normalize(vec3(sun.x*1.5, 0.28, 1.0));
+    float dif = clamp(dot(n, L), 0.0, 1.0);
+    vec3 shadow = mix(uC0, uC3, 0.35);
+    vec3 c = mix(shadow*0.6, uC2*1.05, dif*dif);
+    c += uC1*0.15*(1.0 - dif);
+    c = mix(c, skyH, 1.0 - exp(-z*0.35));
+    col = mix(col, c, smoothstep(hor, hor - 0.004, p.y));
+  }
+  gl_FragColor = vec4(col, 1.0);
+}`;
+
+// Lichter: unscharfe Lichtkreise, die langsam vorbeiziehen
+// uP: x = Größe
+const FS_BOKEH = `
+void main(){
+  vec2 p = P();
+  float t = uTime*0.022;
+  vec3 col = mix(uC0*0.7, uC0*1.5, gl_FragCoord.y/uRes.y);
+  for(int i = 0; i < 26; i++){
+    float fi = float(i);
+    float h1 = h21(vec2(fi, uSeed.x*100.0)), h2 = h21(vec2(fi*1.7, uSeed.y*100.0)), h3 = h21(vec2(fi*2.3, uSeed.z*100.0));
+    vec2 c = vec2((h1*2.0 - 1.0)*2.0 + 0.25*sin(t*(0.5 + h2) + fi),
+                  (h2*2.0 - 1.0)*1.05 + 0.2*cos(t*(0.4 + h3) + fi*1.3));
+    c.x = mod(c.x + t*0.35*(0.3 + h3) + 2.4, 4.8) - 2.4;
+    float r = (0.06 + 0.24*h3*h3)*uP.x;
+    float d = length(p - c);
+    float disk = smoothstep(r, r - 0.012 - r*0.12, d);
+    float ring = smoothstep(r*0.14, 0.0, abs(d - r*0.93))*0.3;
+    float glow = exp(-max(d - r, 0.0)*7.0)*0.1;
+    vec3 lc = ramp(h1*0.9 + t*0.05);
+    float a = (0.1 + 0.2*(1.0 - h3))*(0.65 + 0.35*sin(t*2.5*(0.3 + h1) + fi));
+    col += lc*(disk*(0.75 + 0.25*d/r) + ring + glow)*a;
+  }
+  col = 1.0 - exp(-col*1.3);
+  gl_FragColor = vec4(col, 1.0);
+}`;
+
+// Farbfelder: sechs weiche Farbquellen, die umeinander wandern
+// uP: x = Verwirbelung
+const FS_MESH = `
+void main(){
+  vec2 p = P();
+  float t = uTime*0.022;
+  p += uP.x*vec2(gn(p*0.8 + t), gn(p*0.8 - t + 4.0));
+  vec3 acc = vec3(0.0);
+  float ws = 0.0;
+  for(int i = 0; i < 6; i++){
+    float fi = float(i);
+    float h = h21(vec2(fi, uSeed.x*100.0));
+    vec2 c = vec2(1.4*sin(t*(0.7 + 0.13*fi) + TAU*h), 0.85*cos(t*(0.5 + 0.11*fi) + TAU*h*1.7 + fi));
+    vec3 cc = fi < 1.5 ? uC0 : ramp(fi/6.0 + uSeed.y);
+    float d = dot(p - c, p - c);
+    float w = 1.0/(d*d + 0.03);
+    acc += cc*w; ws += w;
+  }
+  vec3 col = acc/ws;
+  col *= 0.85 + 0.25*(gl_FragCoord.y/uRes.y);
+  gl_FragColor = vec4(col, 1.0);
+}`;
+
+// Strömung: weiche Stromlinien, die durch ein langsam wanderndes Feld fließen
+// uP: x = Maßstab, y = Anzahl Bänder
+const FS_STREAM = `
+void main(){
+  vec2 p = P()*uP.x + uSeed.xy*10.0;
+  float t = uTime*0.014;
+  vec2 w = p + 0.8*vec2(fbm3(p*0.5 + t), fbm3(p*0.5 - t + 3.1));
+  float psi = fbm3(w*0.7 + vec2(0.0, t*0.5));
+  float band = 0.5 + 0.5*sin(psi*uP.y + uTime*0.1);
+  band = band*band*(3.0 - 2.0*band);
+  vec3 c = ramp(psi*0.9 + uSeed.z + t*0.3);
+  vec3 col = mix(uC0, c*0.85, 0.12 + 0.6*band);
+  col += c*pow(band, 12.0)*0.3;
+  vec2 uv = gl_FragCoord.xy/uRes;
+  col *= 0.8 + 0.3*uv.y;
+  gl_FragColor = vec4(col, 1.0);
+}`;
+
+// Meer: ruhige See mit Glitzerpfad unter Mond oder Sonne
+// uP: x = Position der Lichtquelle, y = Horizonthöhe, z = Größe der Lichtquelle
+const FS_SEA = `
+void main(){
+  vec2 p = P();
+  float t = uTime*0.35;
+  float hor = uP.y;
+  vec2 mp = vec2(uP.x, hor + 0.32);
+  vec3 skyH = mix(uC1, uC2, 0.3)*0.7;
+  vec3 col = mix(skyH, uC0, smoothstep(hor, 1.0, p.y));
+  float dm = length(p - mp);
+  col += uC2*smoothstep(uP.z, uP.z - 0.006, dm)*1.1;
+  col += uC2*exp(-dm*5.0)*0.25 + uC1*exp(-dm*1.5)*0.12;
+  if(p.y < hor){
+    vec3 rd = normalize(vec3(p.x, p.y - hor, 1.6));
+    float th = 1.0/(-rd.y);
+    vec2 q = rd.xz*th + vec2(uSeed.x*40.0, t*0.15);
+    vec2 g = vec2(0.0);
+    for(int i = 0; i < 6; i++){
+      float fi = float(i);
+      float an = fi*2.1 + uSeed.y*TAU;
+      vec2 d = vec2(cos(an), sin(an));
+      float fr = 0.9*pow(1.45, fi);
+      float am = 0.06/pow(1.6, fi);
+      g += am*fr*d*cos(dot(d, q)*fr + t*(0.6 + 0.25*fi) + fi);
+    }
+    g *= exp(-th*0.06);
+    vec3 n = normalize(vec3(-g.x, 1.0, -g.y));
+    vec3 md = normalize(vec3(mp.x, mp.y - hor, 1.6));
+    vec3 r = reflect(rd, n);
+    float spec = pow(max(dot(r, md), 0.0), 260.0)*1.4 + pow(max(dot(r, md), 0.0), 24.0)*0.12;
+    float fre = pow(1.0 - max(dot(-rd, n), 0.0), 5.0);
+    vec3 c = mix(uC0*0.8 + uC3*0.05, skyH, 0.2 + 0.8*fre);
+    c += uC2*spec;
+    c = mix(c, skyH, 1.0 - exp(-th*0.05));
+    col = mix(col, c, smoothstep(hor, hor - 0.003, p.y));
+  }
+  gl_FragColor = vec4(col, 1.0);
+}`;
+
+// Wolken: weiche Wolkenschichten, die vor einem Abendhimmel ziehen
+// uP: x = Sonnenposition
+const FS_CLOUDS = `
+void main(){
+  vec2 p = P();
+  float t = uTime*0.012;
+  vec2 sun = vec2(uP.x, -0.35);
+  vec3 col = mix(uC2*0.9, uC0, smoothstep(-0.9, 1.0, p.y));
+  col = mix(col, uC1*0.8, 0.35*smoothstep(0.4, -0.9, p.y));
+  float ds = length(p - sun);
+  col += uC2*exp(-ds*3.0)*0.45;
+  vec2 sd = normalize(sun - p)*0.06;
+  for(int k = 0; k < 3; k++){
+    float fk = float(k);
+    vec2 q = p*vec2(0.55, 1.3)*(1.0 + 0.45*fk) + vec2(t*(1.0 + 0.6*fk), fk*7.0) + uSeed.xy*20.0;
+    float d = fbm3(q) + 0.35*fbm3(q*2.3 - t);
+    float d2 = fbm3(q + sd) + 0.35*fbm3((q + sd)*2.3 - t);
+    float cov = smoothstep(-0.02, 0.35, d + 0.05 - 0.08*fk + 0.1*p.y);
+    float lit = clamp(0.5 + (d2 - d)*6.0, 0.0, 1.0);
+    vec3 cc = mix(mix(uC0, uC3, 0.5)*0.7, mix(uC1, uC2, 0.6 + 0.4*lit), lit);
+    cc = mix(cc, col, 0.25*fk);
+    col = mix(col, cc, cov*0.85);
+  }
+  gl_FragColor = vec4(col, 1.0);
+}`;
+
+const FS_COMPOSITE = `
+#ifdef GL_FRAGMENT_PRECISION_HIGH
+precision highp float;
+#else
+precision mediump float;
+#endif
+uniform sampler2D uA; uniform sampler2D uB;
+uniform float uMix; uniform float uTime; uniform float uGain;
+uniform vec2 uOut;
+float h21(vec2 p){ vec3 q = fract(p.xyx*0.1031); q += dot(q, q.yzx + 33.33); return fract((q.x + q.y)*q.z); }
+void main(){
+  vec2 uv = gl_FragCoord.xy/uOut;
+  vec3 c = texture2D(uA, uv).rgb;
+  if(uMix > 0.0){
+    vec3 b = texture2D(uB, uv).rgb;
+    float m = uMix*uMix*uMix*(uMix*(uMix*6.0 - 15.0) + 10.0);
+    c = mix(c, b, m);
+  }
+  vec2 v = (uv - 0.5)*vec2(uOut.x/uOut.y, 1.0);
+  c *= mix(0.74, 1.0, smoothstep(1.15, 0.3, length(v)));
+  c *= uGain;
+  c += (h21(gl_FragCoord.xy + fract(uTime*7.13)*97.0) - 0.5)/255.0;
+  gl_FragColor = vec4(c, 1.0);
+}`;
+
+// ---------------------------------------------------------------- Farbwelten
+// je Palette: Hintergrund C0 und drei Akzentfarben C1..C3
+const PALETTES = {
+  abendrot:    ['#0b1026', '#e07a8f', '#f2c078', '#8e6bbf'],
+  tiefsee:     ['#03121a', '#1f7a8c', '#7fd1c7', '#2a4d9b'],
+  lavendel:    ['#110b1c', '#7b5ea7', '#f0b49e', '#c38fd1'],
+  nordlicht:   ['#02080f', '#2e8b7a', '#3ddc97', '#8f6bd6'],
+  glut:        ['#120605', '#c4552d', '#f6c177', '#8a2c3b'],
+  jade:        ['#050f0b', '#3f9d7a', '#e8dcc0', '#2f6f8f'],
+  eis:         ['#050a13', '#4a7bb7', '#cfe3f2', '#7aa6c9'],
+  wuestenrose: ['#140b0c', '#b9695a', '#f3d2a6', '#6d4a7a'],
+  mondnacht:   ['#04070f', '#3b4f7a', '#f1f0e6', '#1c2f4f'],
+  morgengrau:  ['#0c0f14', '#8a9bb0', '#f4d9c6', '#56657a'],
+};
+const hex = h => [1, 3, 5].map(i => parseInt(h.substr(i, 2), 16)/255);
+
+// ---------------------------------------------------------------- Welten & Varianten
+const WORLDS = {
+  silk: FS_SILK, aurora: FS_AURORA, ink: FS_INK, topo: FS_TOPO, dunes: FS_DUNES,
+  bokeh: FS_BOKEH, mesh: FS_MESH, stream: FS_STREAM, sea: FS_SEA, clouds: FS_CLOUDS,
+};
+const START_SCALE = { silk: 0.9, aurora: 0.85, ink: 0.8, topo: 0.9, dunes: 0.8,
+                      bokeh: 0.85, mesh: 0.8, stream: 0.85, sea: 0.8, clouds: 0.8 };
+
+const rnd = (a, b) => a + Math.random()*(b - a);
+const pick = arr => arr[Math.floor(Math.random()*arr.length)];
+
+// 25 Varianten: Welt + Farbwelt + Parameterbereich
+const VARIANTS = [
+  { w: 'silk',   pal: 'abendrot',    P: () => [rnd(0.9, 1.2), rnd(-0.15, 0.15), 1.0, 0] },
+  { w: 'silk',   pal: 'tiefsee',     P: () => [rnd(1.3, 1.6), rnd(0.2, 0.35), 0.8, 0] },
+  { w: 'silk',   pal: 'glut',        P: () => [rnd(0.6, 0.8), rnd(-0.3, -0.15), 1.3, 0] },
+  { w: 'silk',   pal: 'morgengrau',  P: () => [rnd(1.0, 1.3), rnd(-0.1, 0.1), 1.1, 0] },
+  { w: 'aurora', pal: 'nordlicht',   P: () => [1.0, 0, 0, 0] },
+  { w: 'aurora', pal: 'eis',         P: () => [0.9, 0, 0, 0] },
+  { w: 'aurora', pal: 'lavendel',    P: () => [0.85, 0, 0, 0] },
+  { w: 'ink',    pal: 'lavendel',    P: () => [rnd(1.8, 2.2), rnd(0.75, 0.9), 0, 0] },
+  { w: 'ink',    pal: 'jade',        P: () => [rnd(2.2, 2.6), rnd(0.6, 0.75), 0, 0] },
+  { w: 'ink',    pal: 'tiefsee',     P: () => [rnd(1.5, 1.9), rnd(0.9, 1.05), 0, 0] },
+  { w: 'topo',   pal: 'eis',         P: () => [Math.round(rnd(9, 12)), 0, 0, 0] },
+  { w: 'topo',   pal: 'glut',        P: () => [Math.round(rnd(7, 10)), 0, 0, 0] },
+  { w: 'dunes',  pal: 'glut',        P: () => [rnd(-0.9, 0.9), 0, 0, 0] },
+  { w: 'dunes',  pal: 'wuestenrose', P: () => [rnd(-0.9, 0.9), 0, 0, 0] },
+  { w: 'bokeh',  pal: 'abendrot',    P: () => [rnd(0.9, 1.2), 0, 0, 0] },
+  { w: 'bokeh',  pal: 'tiefsee',     P: () => [rnd(0.8, 1.1), 0, 0, 0] },
+  { w: 'bokeh',  pal: 'lavendel',    P: () => [rnd(1.1, 1.4), 0, 0, 0] },
+  { w: 'mesh',   pal: 'wuestenrose', P: () => [rnd(0.12, 0.22), 0, 0, 0] },
+  { w: 'mesh',   pal: 'nordlicht',   P: () => [rnd(0.15, 0.28), 0, 0, 0] },
+  { w: 'stream', pal: 'jade',        P: () => [rnd(0.8, 1.0), rnd(45, 58), 0, 0] },
+  { w: 'stream', pal: 'abendrot',    P: () => [rnd(1.0, 1.3), rnd(55, 70), 0, 0] },
+  { w: 'sea',    pal: 'mondnacht',   P: () => [rnd(-0.6, 0.6), rnd(-0.05, 0.1), 0.055, 0] },
+  { w: 'sea',    pal: 'abendrot',    P: () => [rnd(-0.5, 0.5), rnd(-0.1, 0.05), 0.08, 0] },
+  { w: 'clouds', pal: 'abendrot',    P: () => [rnd(-0.8, 0.8), 0, 0, 0] },
+  { w: 'clouds', pal: 'morgengrau',  P: () => [rnd(-0.8, 0.8), 0, 0, 0] },
+];
+
+// ---------------------------------------------------------------- WebGL
+const canvas = document.getElementById('c');
+let gl, quad, comp, progs, targets, ready = false;
+const scale = {}, ceil = {}, disabled = {}, broken = {}, strikes = {};
+for (const w in WORLDS) { scale[w] = START_SCALE[w]; ceil[w] = MAX_SCALE; strikes[w] = 0; }
+
+function compile(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS) && !gl.isContextLost()) {
+    console.warn(gl.getShaderInfoLog(s));
+    gl.deleteShader(s);
+    return null;
+  }
+  return s;
+}
+function program(fsSrc, names) {
+  const vs = compile(gl.VERTEX_SHADER, VS), fs = compile(gl.FRAGMENT_SHADER, fsSrc);
+  if (!vs || !fs) return null;
+  const p = gl.createProgram();
+  gl.attachShader(p, vs); gl.attachShader(p, fs);
+  gl.bindAttribLocation(p, 0, 'aPos');
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) { console.warn(gl.getProgramInfoLog(p)); return null; }
+  const u = {};
+  names.forEach(n => u[n] = gl.getUniformLocation(p, n));
+  return { p, u };
+}
+function makeTarget() { return { tex: gl.createTexture(), fb: gl.createFramebuffer(), w: 0, h: 0 }; }
+function sizeTarget(tg, w, h) {
+  if (tg.w === w && tg.h === h) return;
+  gl.bindTexture(gl.TEXTURE_2D, tg.tex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, tg.fb);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tg.tex, 0);
+  tg.w = w; tg.h = h;
+}
+
+const SCENE_UNIFORMS = ['uRes', 'uTime', 'uSeed', 'uP', 'uC0', 'uC1', 'uC2', 'uC3'];
+
+function initGL() {
+  gl = canvas.getContext('webgl', { antialias: false, alpha: false, depth: false, stencil: false,
+                                     preserveDrawingBuffer: false, powerPreference: 'high-performance' })
+    || canvas.getContext('experimental-webgl');
+  if (!gl) return false;
+
+  quad = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, quad);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(0);
+  gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+
+  comp = program(FS_COMPOSITE, ['uA', 'uB', 'uMix', 'uTime', 'uGain', 'uOut']);
+  progs = {};
+  for (const w in WORLDS) {
+    progs[w] = program(HEAD + WORLDS[w], SCENE_UNIFORMS);
+    broken[w] = !progs[w];
+  }
+  targets = [makeTarget(), makeTarget()];
+  resize();
+  ready = true;
+  return true;
+}
+
+let outW = 0, outH = 0;
+function resize() {
+  const dpr = window.devicePixelRatio || 1;
+  let w = Math.round(innerWidth*dpr), h = Math.round(innerHeight*dpr);
+  if (w > CFG.maxW) { h = Math.round(h*CFG.maxW/w); w = CFG.maxW; }
+  outW = canvas.width = Math.max(w, 1);
+  outH = canvas.height = Math.max(h, 1);
+}
+addEventListener('resize', () => { if (ready) resize(); });
+
+// ---------------------------------------------------------------- Ablauf
+const usable = v => !broken[v.w] && !disabled[v.w] &&
+  (!CFG.only.length || CFG.only.includes(v.w)) && !CFG.skip.includes(v.w);
+const pool = () => CFG.v >= 0 ? [VARIANTS[CFG.v % VARIANTS.length]] : VARIANTS.filter(usable);
+
+// Gemischte Reihenfolge ohne Wiederholung; nie zweimal dieselbe Welt direkt hintereinander.
+let bag = [], lastWorld = null;
+function nextVariant() {
+  const avail = pool();
+  if (!avail.length) return VARIANTS[0];
+  if (avail.length === 1) return avail[0];
+  bag = bag.filter(v => avail.includes(v));
+  if (!bag.length) bag = avail.slice().sort(() => Math.random() - 0.5);
+  let i = bag.findIndex(v => v.w !== lastWorld);
+  if (i < 0) i = 0;
+  const v = bag.splice(i, 1)[0];
+  lastWorld = v.w;
+  return v;
+}
+
+const sceneTime = (inst, now) => (now - inst.start)*CFG.speed;
+
+function makeInstance(v, now) {
+  return {
+    v, w: v.w, idx: VARIANTS.indexOf(v),
+    start: now - CFG.t0/CFG.speed,
+    seed: [Math.random(), Math.random(), Math.random(), Math.random()],
+    pal: PALETTES[v.pal].map(hex),
+    P: v.P(),
+  };
+}
+
+let cur = null, nxt = null, fadeStart = 0, last = 0, t0 = -1;
+
+function beginTransition(now) {
+  if (nxt) return;
+  nxt = makeInstance(nextVariant(), now);
+  nxt.start = now;
+  fadeStart = now;
+}
+
+function renderScene(inst, tg, now) {
+  const pr = progs[inst.w], s = scale[inst.w];
+  const w = Math.max(2, Math.round(outW*s)), h = Math.max(2, Math.round(outH*s));
+  sizeTarget(tg, w, h);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, tg.fb);
+  gl.viewport(0, 0, w, h);
+  gl.useProgram(pr.p);
+  const u = pr.u;
+  gl.uniform2f(u.uRes, w, h);
+  gl.uniform1f(u.uTime, sceneTime(inst, now));
+  gl.uniform4fv(u.uSeed, inst.seed);
+  gl.uniform4fv(u.uP, inst.P);
+  gl.uniform3fv(u.uC0, inst.pal[0]); gl.uniform3fv(u.uC1, inst.pal[1]);
+  gl.uniform3fv(u.uC2, inst.pal[2]); gl.uniform3fv(u.uC3, inst.pal[3]);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+}
+
+function composite(mix, now) {
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  gl.viewport(0, 0, outW, outH);
+  gl.useProgram(comp.p);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, targets[0].tex);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, targets[1].tex);
+  gl.uniform1i(comp.u.uA, 0); gl.uniform1i(comp.u.uB, 1);
+  gl.uniform1f(comp.u.uMix, mix);
+  gl.uniform1f(comp.u.uTime, now % 1000);
+  gl.uniform1f(comp.u.uGain, CFG.bright*(CFG.t0 ? 1 : Math.min(1, (now - t0)/5)));
+  gl.uniform2f(comp.u.uOut, outW, outH);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+}
+
+// Adaptive Auflösung: jede Welt merkt sich ihre eigene Render-Skalierung,
+// damit schwache Player (z. B. im Display eingebaut) flüssig bleiben.
+const perf = { acc: 0, n: 0, t: 0, best: Infinity, fps: 0, cool: 0 };
+function adapt(dt, now) {
+  perf.acc += dt; perf.n++;
+  if (now - perf.t < 1.5) return;
+  const avg = perf.acc/perf.n;
+  perf.acc = 0; perf.n = 0; perf.t = now;
+  perf.fps = 1/avg;
+  if (nxt || now - cur.start < 2.5) return;
+  perf.best = Math.min(perf.best, avg);
+  const w = cur.w;
+  const slow = Math.max(1/45, perf.best*1.3);
+  if (avg > slow) {
+    ceil[w] = Math.min(ceil[w], scale[w]*0.97);
+    scale[w] = Math.max(MIN_SCALE, scale[w]*(avg > slow*1.6 ? 0.72 : 0.86));
+    perf.cool = now + 6;
+    if (scale[w] === MIN_SCALE && avg > Math.max(1/20, perf.best*2.2) && pool().length > 4) {
+      if (++strikes[w] >= 3) { disabled[w] = true; beginTransition(now); }
+    }
+  } else if (avg < Math.max(1/56, perf.best*1.08) && now > perf.cool && scale[w] < ceil[w]) {
+    scale[w] = Math.min(ceil[w], MAX_SCALE, scale[w]*1.06);
+    perf.cool = now + 3;
+  }
+}
+
+// ---------------------------------------------------------------- Hauptschleife
+const dbg = document.getElementById('dbg');
+if (CFG.debug) dbg.style.display = 'block';
+let lastDbg = 0;
+
+function frame(ms) {
+  requestAnimationFrame(frame);
+  if (!ready || gl.isContextLost()) return;
+  const now = ms/1000;
+  if (t0 < 0) {
+    t0 = now; last = now;
+    cur = makeInstance(nextVariant(), now);
+  }
+  let dt = now - last;
+  last = now;
+  if (dt > 0.5) {                     // Tab war im Hintergrund: Zeit einfrieren statt springen
+    const shift = dt - 1/60;
+    cur.start += shift; if (nxt) nxt.start += shift; fadeStart += shift;
+    dt = 1/60;
+  }
+
+  if (!nxt && now - cur.start > CFG.dur - CFG.fade) beginTransition(now);
+  let mix = 0;
+  if (nxt) {
+    mix = (now - fadeStart)/CFG.fade;
+    if (mix >= 1) { cur = nxt; nxt = null; targets.reverse(); mix = 0; }
+  }
+
+  renderScene(cur, targets[0], now);
+  if (nxt) renderScene(nxt, targets[1], now);
+  composite(mix, now);
+  adapt(dt, now);
+
+  if (CFG.debug && now - lastDbg > 0.5) {
+    lastDbg = now;
+    const w = cur.w;
+    dbg.textContent =
+      `Variante ${cur.idx} (${w} · ${cur.v.pal})${nxt ? ' → ' + nxt.idx : ''}\n` +
+      `Zeit     ${sceneTime(cur, now).toFixed(1)} s\n` +
+      `FPS      ${perf.fps.toFixed(1)}\n` +
+      `Ausgabe  ${outW}×${outH}\n` +
+      `Render   ${Math.round(outW*scale[w])}×${Math.round(outH*scale[w])} (${(scale[w]*100).toFixed(0)} %)\n` +
+      Object.keys(WORLDS).map(k => `  ${k.padEnd(7)} ${(scale[k]*100).toFixed(0).padStart(3)} %${disabled[k] ? ' (aus)' : ''}${broken[k] ? ' (Fehler)' : ''}`).join('\n');
+  }
+}
+
+// ---------------------------------------------------------------- Bedienung & Robustheit
+function skip() {
+  if (!ready || !cur) return;
+  if (nxt) { cur = nxt; nxt = null; targets.reverse(); }
+  beginTransition(performance.now()/1000);
+}
+addEventListener('mousedown', skip);
+addEventListener('keydown', e => {
+  if (e.key === 'ArrowRight' || e.key === ' ') skip();
+  if (e.key === 'd' || e.key === 'D') { CFG.debug = !CFG.debug; dbg.style.display = CFG.debug ? 'block' : 'none'; }
+});
+
+let lostTimer = 0;
+canvas.addEventListener('webglcontextlost', e => {
+  e.preventDefault(); ready = false;
+  lostTimer = setTimeout(() => location.reload(), 8000);
+});
+canvas.addEventListener('webglcontextrestored', () => {
+  clearTimeout(lostTimer);
+  if (initGL()) { t0 = -1; nxt = null; }
+});
+
+if (CFG.reloadH > 0) setTimeout(() => location.reload(), CFG.reloadH*3600*1000);
+
+if (initGL()) requestAnimationFrame(frame);
+</script>
+</body>
+</html>
