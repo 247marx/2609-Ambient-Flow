@@ -37,7 +37,8 @@
  *   ?only=silk,sea nur bestimmte Welten: silk aurora ink topo dunes bokeh mesh stream sea clouds
  *   ?skip=topo     Welten auslassen
  *   ?v=7           nur eine bestimmte Variante (Nummer 0..24), zum Testen
- *   ?maxres=1920   maximale interne Breite in Pixeln
+ *   ?maxres=1600   maximale interne Breite in Pixeln
+ *   ?fps=30        Bildrate (30 schont schwache Player, 60 = flüssiger)
  *   ?brightness=1  Helligkeit
  *   ?debug=1       FPS/Auflösung einblenden (Taste D)
  *   ?reload=12     Seite alle x Stunden neu laden (Standard: aus)
@@ -51,7 +52,8 @@ const CFG = {
   dur:     +Q.get('dur') || 100,
   fade:    +Q.get('fade') || 20,
   speed:   +Q.get('speed') || 1,
-  maxW:    +Q.get('maxres') || 1920,
+  maxW:    +Q.get('maxres') || 1600,
+  fps:     +Q.get('fps') || 30,
   debug:   Q.get('debug') === '1',
   only:    list('only'),
   skip:    list('skip'),
@@ -394,12 +396,14 @@ precision mediump float;
 uniform sampler2D uA; uniform sampler2D uB;
 uniform float uMix; uniform float uTime; uniform float uGain;
 uniform vec2 uOut;
+uniform vec2 uSA; uniform vec2 uSB;
 float h21(vec2 p){ vec3 q = fract(p.xyx*0.1031); q += dot(q, q.yzx + 33.33); return fract((q.x + q.y)*q.z); }
 void main(){
   vec2 uv = gl_FragCoord.xy/uOut;
-  vec3 c = texture2D(uA, uv).rgb;
+  vec2 hp = 0.5/uOut;
+  vec3 c = texture2D(uA, min(uv*uSA, uSA - hp)).rgb;
   if(uMix > 0.0){
-    vec3 b = texture2D(uB, uv).rgb;
+    vec3 b = texture2D(uB, min(uv*uSB, uSB - hp)).rgb;
     float m = uMix*uMix*uMix*(uMix*(uMix*6.0 - 15.0) + 10.0);
     c = mix(c, b, m);
   }
@@ -523,7 +527,7 @@ function initGL() {
   gl.enableVertexAttribArray(0);
   gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
 
-  comp = program(FS_COMPOSITE, ['uA', 'uB', 'uMix', 'uTime', 'uGain', 'uOut']);
+  comp = program(FS_COMPOSITE, ['uA', 'uB', 'uMix', 'uTime', 'uGain', 'uOut', 'uSA', 'uSB']);
   progs = {};
   for (const w in WORLDS) {
     progs[w] = program(HEAD + WORLDS[w], SCENE_UNIFORMS);
@@ -542,6 +546,9 @@ function resize() {
   if (w > CFG.maxW) { h = Math.round(h*CFG.maxW/w); w = CFG.maxW; }
   outW = canvas.width = Math.max(w, 1);
   outH = canvas.height = Math.max(h, 1);
+  // Zwischenpuffer einmal in voller Größe anlegen; die Szenen nutzen davon nur einen Teil.
+  // Ständiges Neuanlegen bei jeder Auflösungsänderung bringt schwache Player zum Absturz.
+  targets.forEach(tg => sizeTarget(tg, outW, outH));
 }
 addEventListener('resize', () => { if (ready) resize(); });
 
@@ -589,7 +596,7 @@ function beginTransition(now) {
 function renderScene(inst, tg, now) {
   const pr = progs[inst.w], s = scale[inst.w];
   const w = Math.max(2, Math.round(outW*s)), h = Math.max(2, Math.round(outH*s));
-  sizeTarget(tg, w, h);
+  tg.vw = w; tg.vh = h;
   gl.bindFramebuffer(gl.FRAMEBUFFER, tg.fb);
   gl.viewport(0, 0, w, h);
   gl.useProgram(pr.p);
@@ -614,6 +621,8 @@ function composite(mix, now) {
   gl.uniform1f(comp.u.uTime, now % 1000);
   gl.uniform1f(comp.u.uGain, CFG.bright*(CFG.t0 ? 1 : Math.min(1, (now - t0)/5)));
   gl.uniform2f(comp.u.uOut, outW, outH);
+  gl.uniform2f(comp.u.uSA, (targets[0].vw || outW)/outW, (targets[0].vh || outH)/outH);
+  gl.uniform2f(comp.u.uSB, (targets[1].vw || outW)/outW, (targets[1].vh || outH)/outH);
   gl.drawArrays(gl.TRIANGLES, 0, 3);
 }
 
@@ -629,15 +638,16 @@ function adapt(dt, now) {
   if (nxt || now - cur.start < 2.5) return;
   perf.best = Math.min(perf.best, avg);
   const w = cur.w;
-  const slow = Math.max(1/45, perf.best*1.3);
+  const target = 1/CFG.fps;
+  const slow = Math.max(target*1.3, perf.best*1.3);
   if (avg > slow) {
     ceil[w] = Math.min(ceil[w], scale[w]*0.97);
     scale[w] = Math.max(MIN_SCALE, scale[w]*(avg > slow*1.6 ? 0.72 : 0.86));
     perf.cool = now + 6;
-    if (scale[w] === MIN_SCALE && avg > Math.max(1/20, perf.best*2.2) && pool().length > 4) {
+    if (scale[w] === MIN_SCALE && avg > Math.max(target*2, perf.best*2.2) && pool().length > 4) {
       if (++strikes[w] >= 3) { disabled[w] = true; beginTransition(now); }
     }
-  } else if (avg < Math.max(1/56, perf.best*1.08) && now > perf.cool && scale[w] < ceil[w]) {
+  } else if (avg < Math.max(target*1.12, perf.best*1.08) && now > perf.cool && scale[w] < ceil[w]) {
     scale[w] = Math.min(ceil[w], MAX_SCALE, scale[w]*1.06);
     perf.cool = now + 3;
   }
@@ -652,6 +662,7 @@ function frame(ms) {
   requestAnimationFrame(frame);
   if (!ready || gl.isContextLost()) return;
   const now = ms/1000;
+  if (t0 >= 0 && now - last < 1/CFG.fps - 0.004) return;   // Bildrate begrenzen
   if (t0 < 0) {
     t0 = now; last = now;
     cur = makeInstance(nextVariant(), now);
@@ -704,7 +715,7 @@ addEventListener('keydown', e => {
 let lostTimer = 0;
 canvas.addEventListener('webglcontextlost', e => {
   e.preventDefault(); ready = false;
-  lostTimer = setTimeout(() => location.reload(), 8000);
+  lostTimer = setTimeout(() => location.reload(), 20000);
 });
 canvas.addEventListener('webglcontextrestored', () => {
   clearTimeout(lostTimer);
@@ -714,6 +725,11 @@ canvas.addEventListener('webglcontextrestored', () => {
 if (CFG.reloadH > 0) setTimeout(() => location.reload(), CFG.reloadH*3600*1000);
 
 if (initGL()) requestAnimationFrame(frame);
+
+// Offline-Kopie: ein Neuladen klappt auch, wenn das Netz gerade hakt.
+if ('serviceWorker' in navigator && location.protocol === 'https:') {
+  navigator.serviceWorker.register('sw.js').catch(() => {});
+}
 </script>
 </body>
 </html>

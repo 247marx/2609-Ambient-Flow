@@ -19,7 +19,8 @@ Eine einzige `index.html`, keine Abhängigkeiten, alles wird live per WebGL bere
 | `?only=sea,silk` | nur diese Welten | alle |
 | `?skip=topo` | Welten auslassen | – |
 | `?brightness=0.8` | Helligkeit | 1 |
-| `?maxres=1280` | max. interne Breite (für schwache Player) | 1920 |
+| `?maxres=1280` | max. interne Breite (für schwache Player) | 1600 |
+| `?fps=30` | Bildrate (30 schont den Player, 60 = flüssiger) | 30 |
 | `?debug=1` | FPS und Auflösung einblenden | aus |
 
 Beispiel: `https://247marx.github.io/2609-Ambient-Flow/?speed=0.8&brightness=0.9`
